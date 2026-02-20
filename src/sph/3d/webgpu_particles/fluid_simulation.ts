@@ -4,15 +4,8 @@
  * =============================================================================
  */
 
-import type { SimState } from '../common/types.ts';
 import type { ParticlesConfig } from './types.ts';
-import { createSpawnData } from '../common/spawn.ts';
-import { FluidBuffers } from '../common/fluid_buffers.ts';
-import {
-  SpatialGrid,
-  type SpatialGridUniforms,
-} from '../common/spatial_grid.ts';
-import { FluidPhysics, type PhysicsUniforms } from '../common/fluid_physics.ts';
+import { FluidSimulationBase } from '../common/fluid_simulation_base.ts';
 import { Renderer } from './renderer.ts';
 import { mat4Perspective, mat4Multiply } from '../common/math_utils.ts';
 import { DensitySplatPipeline } from './density_splat_pipeline.ts';
@@ -20,52 +13,20 @@ import { PickingSystem } from '../common/picking_system.ts';
 
 /**
  * Orchestrates the full SPH fluid simulation pipeline on the GPU.
+ *
+ * Beginner note:
+ * This class is the "CPU-side conductor." It prepares uniform data,
+ * records GPU commands (compute + render), and submits them every frame.
+ * The heavy math runs entirely on the GPU in WGSL shaders.
  */
-export class FluidSimulation {
-  /**
-   * Beginner note:
-   * This class is the "CPU-side conductor." It prepares uniform data,
-   * records GPU commands (compute + render), and submits them every frame.
-   * The heavy math runs entirely on the GPU in WGSL shaders.
-   */
-  private device: GPUDevice;
-  private context: GPUCanvasContext;
-  private config: ParticlesConfig;
-
-  // --- Subsystems (Modular) ---
-  private buffers!: FluidBuffers;
-  private physics: FluidPhysics;
-  private grid: SpatialGrid;
+export class FluidSimulation extends FluidSimulationBase<ParticlesConfig> {
   private renderer: Renderer;
   private splatPipeline: DensitySplatPipeline;
   private pickingSystem: PickingSystem;
 
-  private state!: SimState;
-
-  // --- Grid Configuration ---
-  private gridRes = { x: 0, y: 0, z: 0 };
-  private gridTotalCells = 0;
-
-  // --- Interaction State ---
-  private isPicking = false;
-  private interactionPos = { x: 0, y: 0, z: 0 };
-
-  // --- Uniform Buffers ---
-  private physicsUniforms!: PhysicsUniforms;
-  private gridUniforms!: SpatialGridUniforms;
   private cullUniformBuffer: GPUBuffer;
 
-  // --- CPU Staging Buffers ---
-  private computeData = new Float32Array(8);
-  private integrateData = new Float32Array(24);
-  private hashParamsData = new Float32Array(8);
-  private sortParamsData = new Uint32Array(8);
-  private scanParamsDataL0 = new Uint32Array(4);
-  private scanParamsDataL1 = new Uint32Array(4);
-  private scanParamsDataL2 = new Uint32Array(4);
-  private densityParamsData = new Float32Array(12);
-  private pressureParamsData = new Float32Array(16);
-  private viscosityParamsData = new Float32Array(12);
+  // --- CPU Staging Buffers (particles-specific) ---
   private cullParamsData = new Float32Array(20);
   private indirectArgs = new Uint32Array([6, 0, 0, 0]);
 
@@ -76,62 +37,11 @@ export class FluidSimulation {
     config: ParticlesConfig,
     format: GPUTextureFormat
   ) {
-    this.device = device;
-    this.context = context;
-    this.config = config;
+    super(device, context, config);
 
-    this.physics = new FluidPhysics(device);
-    this.grid = new SpatialGrid(device);
     this.renderer = new Renderer(device, canvas, format, config);
     this.splatPipeline = new DensitySplatPipeline(device);
     this.pickingSystem = new PickingSystem(device);
-
-    // Create all uniform buffers upfront
-    this.physicsUniforms = {
-      external: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      density: device.createBuffer({
-        size: 48,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      pressure: device.createBuffer({
-        size: 64,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      viscosity: device.createBuffer({
-        size: 48,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      integrate: device.createBuffer({
-        size: 96,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-    };
-
-    this.gridUniforms = {
-      hash: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      sort: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      scanL0: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      scanL1: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      scanL2: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-    };
 
     this.cullUniformBuffer = device.createBuffer({
       size: 80,
@@ -141,37 +51,10 @@ export class FluidSimulation {
     this.reset();
   }
 
-  get particleCount(): number {
-    return this.buffers.particleCount;
-  }
-
-  get simulationState(): SimState {
-    return this.state;
-  }
-
   reset(): void {
     // Reset = recreate GPU buffers + bind groups so shaders read the new data.
-    if (this.buffers) {
-      this.buffers.destroy();
-    }
+    this.resetBuffers();
 
-    const { boundsSize, smoothingRadius } = this.config;
-    this.gridRes = {
-      x: Math.ceil(boundsSize.x / smoothingRadius),
-      y: Math.ceil(boundsSize.y / smoothingRadius),
-      z: Math.ceil(boundsSize.z / smoothingRadius),
-    };
-    this.gridTotalCells = this.gridRes.x * this.gridRes.y * this.gridRes.z;
-
-    const spawn = createSpawnData(this.config);
-    this.state = this.createStateFromSpawn(spawn);
-
-    this.buffers = new FluidBuffers(this.device, spawn, {
-      gridTotalCells: this.gridTotalCells,
-    });
-
-    this.physics.createBindGroups(this.buffers, this.physicsUniforms);
-    this.grid.createBindGroups(this.buffers, this.gridUniforms);
     this.splatPipeline.recreate(this.config, this.buffers.predicted);
     this.pickingSystem.createBindGroup(this.buffers.positions);
 
@@ -190,29 +73,6 @@ export class FluidSimulation {
       this.config
     );
     this.device.queue.submit([encoder.finish()]);
-  }
-
-  private createStateFromSpawn(spawn: {
-    positions: Float32Array;
-    velocities: Float32Array;
-    count: number;
-  }): SimState {
-    return {
-      positions: spawn.positions,
-      predicted: new Float32Array(spawn.positions),
-      velocities: spawn.velocities,
-      densities: new Float32Array(spawn.count * 2),
-      keys: new Uint32Array(spawn.count),
-      sortedKeys: new Uint32Array(spawn.count),
-      indices: new Uint32Array(spawn.count),
-      sortOffsets: new Uint32Array(spawn.count),
-      spatialOffsets: new Uint32Array(spawn.count),
-      positionsSorted: new Float32Array(spawn.count * 4),
-      predictedSorted: new Float32Array(spawn.count * 4),
-      velocitiesSorted: new Float32Array(spawn.count * 4),
-      count: spawn.count,
-      input: { worldX: 0, worldY: 0, worldZ: 0, pull: false, push: false },
-    };
   }
 
   async step(dt: number): Promise<void> {
@@ -346,26 +206,7 @@ export class FluidSimulation {
     device.queue.writeBuffer(this.gridUniforms.sort, 0, this.sortParamsData);
 
     // 4) Prefix-sum params (hierarchical scan sizes)
-    const blocksL0 = Math.ceil((this.gridTotalCells + 1) / 512);
-    const blocksL1 = Math.ceil(blocksL0 / 512);
-    this.scanParamsDataL0[0] = this.gridTotalCells + 1;
-    this.scanParamsDataL1[0] = blocksL0;
-    this.scanParamsDataL2[0] = blocksL1;
-    device.queue.writeBuffer(
-      this.gridUniforms.scanL0,
-      0,
-      this.scanParamsDataL0
-    );
-    device.queue.writeBuffer(
-      this.gridUniforms.scanL1,
-      0,
-      this.scanParamsDataL1
-    );
-    device.queue.writeBuffer(
-      this.gridUniforms.scanL2,
-      0,
-      this.scanParamsDataL2
-    );
+    this.updatePrefixSumUniforms();
 
     // 5) Density kernel constants + bounds
     const radius = config.smoothingRadius;

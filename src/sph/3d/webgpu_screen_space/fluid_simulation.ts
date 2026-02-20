@@ -4,64 +4,28 @@
  * =============================================================================
  */
 
-import type { SimState } from '../common/types.ts';
 import type { ScreenSpaceConfig } from './types.ts';
-import { createSpawnData } from '../common/spawn.ts';
+import { FluidSimulationBase } from '../common/fluid_simulation_base.ts';
 import { FluidBuffers } from '../common/fluid_buffers.ts';
-import {
-  SpatialGrid,
-  type SpatialGridUniforms,
-} from '../common/spatial_grid.ts';
-import { FluidPhysics, type PhysicsUniforms } from '../common/fluid_physics.ts';
 import { FoamPipeline, type FoamUniforms } from '../common/foam_pipeline.ts';
 import { ScreenSpaceRenderer } from './screen_space/screen_space_renderer.ts';
 import { PickingSystem } from '../common/picking_system.ts';
 
-export class FluidSimulation {
+export class FluidSimulation extends FluidSimulationBase<ScreenSpaceConfig> {
   /**
    * Beginner note:
    * This class records compute passes for SPH + foam, then hands particle
    * buffers to the screen-space renderer for post-processing.
    */
-  private device: GPUDevice;
-  private context: GPUCanvasContext;
   private canvas: HTMLCanvasElement;
-  private config: ScreenSpaceConfig;
-
-  // --- Subsystems (Modular) ---
-  private buffers!: FluidBuffers;
-  private physics: FluidPhysics;
-  private grid: SpatialGrid;
   private foam: FoamPipeline;
   private renderer: ScreenSpaceRenderer;
   private pickingSystem: PickingSystem;
 
-  private state!: SimState;
-
-  // --- Grid Configuration ---
-  private gridRes = { x: 0, y: 0, z: 0 };
-  private gridTotalCells = 0;
-
-  // --- Interaction State ---
-  private isPicking = false;
-  private interactionPos = { x: 0, y: 0, z: 0 };
-
-  // --- Uniform Buffers ---
-  private physicsUniforms!: PhysicsUniforms;
-  private gridUniforms!: SpatialGridUniforms;
+  // --- Uniform Buffers (screen-space specific) ---
   private foamUniforms!: FoamUniforms;
 
-  // --- CPU Staging Buffers ---
-  private computeData = new Float32Array(8);
-  private integrateData = new Float32Array(24);
-  private hashParamsData = new Float32Array(8);
-  private sortParamsData = new Uint32Array(8);
-  private scanParamsDataL0 = new Uint32Array(4);
-  private scanParamsDataL1 = new Uint32Array(4);
-  private scanParamsDataL2 = new Uint32Array(4);
-  private densityParamsData = new Float32Array(12);
-  private pressureParamsData = new Float32Array(16);
-  private viscosityParamsData = new Float32Array(12);
+  // --- CPU Staging Buffers (screen-space specific) ---
   private foamSpawnData = new Float32Array(28);
   private foamUpdateData = new Float32Array(28);
 
@@ -75,62 +39,12 @@ export class FluidSimulation {
     config: ScreenSpaceConfig,
     format: GPUTextureFormat
   ) {
-    this.device = device;
-    this.context = context;
-    this.canvas = canvas;
-    this.config = config;
+    super(device, context, config);
 
-    this.physics = new FluidPhysics(device);
-    this.grid = new SpatialGrid(device);
+    this.canvas = canvas;
     this.foam = new FoamPipeline(device);
     this.renderer = new ScreenSpaceRenderer(device, canvas, format, config);
     this.pickingSystem = new PickingSystem(device);
-
-    this.physicsUniforms = {
-      external: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      density: device.createBuffer({
-        size: 48,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      pressure: device.createBuffer({
-        size: 64,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      viscosity: device.createBuffer({
-        size: 48,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      integrate: device.createBuffer({
-        size: 96,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-    };
-
-    this.gridUniforms = {
-      hash: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      sort: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      scanL0: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      scanL1: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      scanL2: device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-    };
 
     this.foamUniforms = {
       spawn: device.createBuffer({
@@ -146,67 +60,18 @@ export class FluidSimulation {
     this.reset();
   }
 
-  get particleCount(): number {
-    return this.buffers.particleCount;
-  }
-
-  get simulationState(): SimState {
-    return this.state;
-  }
-
   reset(): void {
-    if (this.buffers) {
-      this.buffers.destroy();
-    }
-
     this.simTimer = 0;
     this.foamFrameCount = 0;
 
-    const { boundsSize, smoothingRadius } = this.config;
-    this.gridRes = {
-      x: Math.ceil(boundsSize.x / smoothingRadius),
-      y: Math.ceil(boundsSize.y / smoothingRadius),
-      z: Math.ceil(boundsSize.z / smoothingRadius),
-    };
-    this.gridTotalCells = this.gridRes.x * this.gridRes.y * this.gridRes.z;
-
-    const spawn = createSpawnData(this.config);
-    this.state = this.createStateFromSpawn(spawn);
-
-    this.buffers = new FluidBuffers(this.device, spawn, {
-      gridTotalCells: this.gridTotalCells,
+    this.resetBuffers({
       includeFoam: true,
       maxFoamParticles: FluidBuffers.DEFAULT_MAX_FOAM_PARTICLES,
     });
 
-    this.physics.createBindGroups(this.buffers, this.physicsUniforms);
-    this.grid.createBindGroups(this.buffers, this.gridUniforms);
     this.foam.createBindGroups(this.buffers, this.foamUniforms);
     this.renderer.createBindGroups(this.buffers);
     this.pickingSystem.createBindGroup(this.buffers.positions);
-  }
-
-  private createStateFromSpawn(spawn: {
-    positions: Float32Array;
-    velocities: Float32Array;
-    count: number;
-  }): SimState {
-    return {
-      positions: spawn.positions,
-      predicted: new Float32Array(spawn.positions),
-      velocities: spawn.velocities,
-      densities: new Float32Array(spawn.count * 2),
-      keys: new Uint32Array(spawn.count),
-      sortedKeys: new Uint32Array(spawn.count),
-      indices: new Uint32Array(spawn.count),
-      sortOffsets: new Uint32Array(spawn.count),
-      spatialOffsets: new Uint32Array(spawn.count),
-      positionsSorted: new Float32Array(spawn.count * 4),
-      predictedSorted: new Float32Array(spawn.count * 4),
-      velocitiesSorted: new Float32Array(spawn.count * 4),
-      count: spawn.count,
-      input: { worldX: 0, worldY: 0, worldZ: 0, pull: false, push: false },
-    };
   }
 
   async step(dt: number): Promise<void> {
@@ -332,26 +197,7 @@ export class FluidSimulation {
     device.queue.writeBuffer(this.gridUniforms.sort, 0, this.sortParamsData);
 
     // 4. Scan
-    const blocksL0 = Math.ceil((this.gridTotalCells + 1) / 512);
-    const blocksL1 = Math.ceil(blocksL0 / 512);
-    this.scanParamsDataL0[0] = this.gridTotalCells + 1;
-    this.scanParamsDataL1[0] = blocksL0;
-    this.scanParamsDataL2[0] = blocksL1;
-    device.queue.writeBuffer(
-      this.gridUniforms.scanL0,
-      0,
-      this.scanParamsDataL0
-    );
-    device.queue.writeBuffer(
-      this.gridUniforms.scanL1,
-      0,
-      this.scanParamsDataL1
-    );
-    device.queue.writeBuffer(
-      this.gridUniforms.scanL2,
-      0,
-      this.scanParamsDataL2
-    );
+    this.updatePrefixSumUniforms();
 
     // 5. Density
     const radius = config.smoothingRadius;
@@ -523,18 +369,18 @@ export class FluidSimulation {
     this.foamUpdateData[2] = 0.04;
     this.foamUpdateData[3] = config.bubbleBuoyancy;
 
-    const hx = config.boundsSize.x * 0.5;
-    const hz = config.boundsSize.z * 0.5;
-    const minY = -5.0;
+    const fhx = config.boundsSize.x * 0.5;
+    const fhz = config.boundsSize.z * 0.5;
+    const fminY = -5.0;
 
-    this.foamUpdateData[4] = hx;
-    this.foamUpdateData[5] = minY + config.boundsSize.y;
-    this.foamUpdateData[6] = hz;
+    this.foamUpdateData[4] = fhx;
+    this.foamUpdateData[5] = fminY + config.boundsSize.y;
+    this.foamUpdateData[6] = fhz;
     this.foamUpdateData[7] = config.smoothingRadius;
 
-    this.foamUpdateData[8] = -hx;
-    this.foamUpdateData[9] = minY;
-    this.foamUpdateData[10] = -hz;
+    this.foamUpdateData[8] = -fhx;
+    this.foamUpdateData[9] = fminY;
+    this.foamUpdateData[10] = -fhz;
     this.foamUpdateData[11] = 0;
 
     this.foamUpdateData[12] = this.gridRes.x;
