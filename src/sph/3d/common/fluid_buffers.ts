@@ -45,6 +45,10 @@ export class FluidBuffers {
   groupSumsL2: GPUBuffer;
   scanScratch: GPUBuffer;
 
+  // --- Alt Prefix Sum (reduce → spineScan → downSweep) ---
+  altScanReduction: GPUBuffer | null = null;
+  altScanOutput: GPUBuffer | null = null;
+
   // --- Sorted Physical Data (Cache optimization) ---
   positionsSorted: GPUBuffer;
   predictedSorted: GPUBuffer;
@@ -115,8 +119,23 @@ export class FluidBuffers {
         spawn.count * 4,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
       );
+
+      // Pad to the next multiple of 4 u32s so the alt reduce/downSweep can
+      // safely interpret sortOffsets as array<vec4<u32>>.
+      const paddedN = Math.ceil((gridTotalCells + 1) / 4) * 4;
       this.sortOffsets = this.createEmptyBuffer(
-        (gridTotalCells + 1) * 4,
+        paddedN * 4,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      );
+
+      // Alt prefix sum buffers (always allocated alongside the classic ones).
+      const altWGCount = Math.ceil(paddedN / 4096);
+      this.altScanReduction = this.createEmptyBuffer(
+        altWGCount * 4,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      );
+      this.altScanOutput = this.createEmptyBuffer(
+        paddedN * 4,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
       );
 
@@ -262,6 +281,8 @@ export class FluidBuffers {
     this.particleCellOffsets?.destroy();
     this.spatialOffsets?.destroy();
     this.sortedKeys?.destroy();
+    this.altScanReduction?.destroy();
+    this.altScanOutput?.destroy();
     this.foamPositions?.destroy();
     this.foamVelocities?.destroy();
     this.foamCounter?.destroy();

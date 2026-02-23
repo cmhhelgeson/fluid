@@ -52,6 +52,7 @@ export abstract class FluidSimulationBase<
   protected scanParamsDataL0 = new Uint32Array(4);
   protected scanParamsDataL1 = new Uint32Array(4);
   protected scanParamsDataL2 = new Uint32Array(4);
+  protected altScanParamsData = new Uint32Array(4);
   protected densityParamsData = new Float32Array(12);
   protected pressureParamsData = new Float32Array(16);
   protected viscosityParamsData = new Float32Array(12);
@@ -106,6 +107,10 @@ export abstract class FluidSimulationBase<
       }),
       scanL2: device.createBuffer({
         size: 32,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      }),
+      altScan: device.createBuffer({
+        size: 16, // 4 × u32: workgroupCount, workgroupSize, vecCount, workPerInvocation
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       }),
     };
@@ -176,6 +181,27 @@ export abstract class FluidSimulationBase<
       0,
       this.scanParamsDataL2
     );
+
+    // Alt prefix sum params — derived from SpatialGrid static constants so
+    // the GPU uniform always matches what dispatch() computes on the CPU side.
+    const paddedN = Math.ceil((this.gridTotalCells + 1) / 4) * 4;
+    const workgroupCount = Math.ceil(paddedN / SpatialGrid.ALT_PARTITION_SIZE);
+    this.altScanParamsData[0] = workgroupCount;
+    this.altScanParamsData[1] = SpatialGrid.ALT_WORKGROUP_SIZE;
+    this.altScanParamsData[2] = paddedN / 4; // vecCount
+    this.altScanParamsData[3] = SpatialGrid.ALT_WORK_PER_INVOCATION;
+    this.device.queue.writeBuffer(
+      this.gridUniforms.altScan,
+      0,
+      this.altScanParamsData
+    );
+  }
+
+  abstract reset(): void;
+
+  setPrefixSumMode(mode: 'classic' | 'alt'): void {
+    this.grid.useAltPrefixSum = mode === 'alt';
+    this.reset();
   }
 
   protected createStateFromSpawn(spawn: SpawnData): SimState {

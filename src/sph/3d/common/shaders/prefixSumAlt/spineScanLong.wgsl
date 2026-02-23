@@ -17,6 +17,8 @@ struct PrefixSumParams {
     workPerInvocation: u32
 }
 
+@group(0) @binding(1) var<uniform> params: PrefixSumParams;
+
 @compute @workgroup_size( 256, 1, 1 )
 fn spineScanLong(
     @builtin( local_invocation_index ) invocationLocalIndex : u32,
@@ -73,7 +75,7 @@ fn spineScanLong(
 	subgroupAlignedSize = ( 1u << nodeVar0 );
     var unvectorizedWorkPerInvocation = params.workPerInvocation * 4u;
 	spinePartitionSize = params.workgroupSize * unvectorizedWorkPerInvocation;
-	spineAlignedSize = ( ( spinePartitionSize + par ) - 1u );
+	spineAlignedSize = ( ( spinePartitionSize + params.workgroupCount ) - 1u );
 	spineAlignedSize = ( spineAlignedSize / spinePartitionSize );
 	spineAlignedSize = ( spineAlignedSize * spinePartitionSize );
 	nodeVar1 = array< u32, 16 >( 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u );
@@ -89,7 +91,7 @@ fn spineScanLong(
 		for ( var k : u32 = 0u; k < unvectorizedWorkPerInvocation; k ++ ) {
 
 
-			if ( ( f32( nodeVar2 ) < params.workgroupCount ) ) {
+			if ( nodeVar2 < params.workgroupCount ) {
 
 				nodeVar1[ k ] = Prefix_Sum_Reduction_0.value[ nodeVar2 ];
 
@@ -136,7 +138,7 @@ fn spineScanLong(
 
 					nodeVar13 = ( nodeVar12 < spineSize );
 
-					if ( ( nodeVar13 && ( f32( ( ( nodeVar12 + 1u ) & ( nodeVar11 - 1u ) ) ) != 0.0 ) ) ) {
+					if ( ( nodeVar13 && ( ( ( nodeVar12 + 1u ) & ( nodeVar11 - 1u ) ) != 0u ) ) ) {
 
 						WorkgroupArray_898[ nodeVar12 ] = ( WorkgroupArray_898[ nodeVar12 ] + select( 0u, WorkgroupArray_898[ ( ( ( nodeVar12 >> nodeVar4 ) << nodeVar4 ) - 1u ) ], nodeVar13 ) );
 
@@ -161,9 +163,9 @@ fn spineScanLong(
 		for ( var k : u32 = 0u; k < unvectorizedWorkPerInvocation; k ++ ) {
 
 
-			if ( ( f32( nodeVar15 ) < params.workgroupCount ) ) {
+			if ( nodeVar15 < params.workgroupCount ) {
 
-				Prefix_Sum_Reduction_0.value[ nodeVar15 ] = ( nodeVar1[ k ] + ( select( 0u, WorkgroupArray_898[ ( invocationSubgroupMetaIndex - 1u ) ], ( f32( invocationSubgroupMetaIndex ) != 0.0 ) ) + previousReduction ) );
+				Prefix_Sum_Reduction_0.value[ nodeVar15 ] = ( nodeVar1[ k ] + ( select( 0u, WorkgroupArray_898[ ( invocationSubgroupMetaIndex - 1u ) ], ( invocationSubgroupMetaIndex != 0u ) ) + previousReduction ) );
 
 			}
 
@@ -171,7 +173,7 @@ fn spineScanLong(
 
 		}
 
-		previousReduction = ( previousReduction + u32( subgroupBroadcast( f32( WorkgroupArray_898[ ( subgroupAlignedSize - 1u ) ] ), 0 ) ) );
+		previousReduction = ( previousReduction + subgroupBroadcast( WorkgroupArray_898[ ( subgroupAlignedSize - 1u ) ], 0u ) );
 		workgroupBarrier();
 
 	}

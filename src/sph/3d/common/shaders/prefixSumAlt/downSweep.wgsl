@@ -30,6 +30,8 @@ struct PrefixSumParams {
     workPerInvocation: u32
 }
 
+@group(0) @binding(3) var<uniform> params: PrefixSumParams;
+
 @compute @workgroup_size( 256, 1, 1 )
 fn downSweep(
     @builtin( local_invocation_index ) invocationLocalIndex : u32,
@@ -195,7 +197,7 @@ fn downSweep(
 	}
 
 	workgroupBarrier();
-	nodeVar3 = ( select( 0u, Prefix_Sum_Reduction_0.value[ ( workgroupId.x - 1u ) ], ( workgroupId.x != 0u ) ) + select( 0u, WorkgroupArray_898[ ( invocationSubgroupMetaIndex - 1u ) ], ( f32( invocationSubgroupMetaIndex ) != 0.0 ) ) );
+	nodeVar3 = ( select( 0u, Prefix_Sum_Reduction_0.value[ ( workgroupId.x - 1u ) ], ( workgroupId.x != 0u ) ) + select( 0u, WorkgroupArray_898[ ( invocationSubgroupMetaIndex - 1u ) ], ( invocationSubgroupMetaIndex != 0u ) ) );
 	nodeVar1 = nodeVar0;
 
 	if ( ( workgroupId.x < ( params.workgroupCount - 1u ) ) ) {
